@@ -1,0 +1,181 @@
+ package org.apache.hadoop.examples;
+20 
+21 import java.io.IOException;
+22 import java.net.URI;
+23 import java.util.*;
+24 
+25 import org.apache.hadoop.conf.Configuration;
+26 import org.apache.hadoop.conf.Configured;
+27 import org.apache.hadoop.filecache.DistributedCache;
+28 import org.apache.hadoop.fs.Path;
+29 import org.apache.hadoop.io.BytesWritable;
+30 import org.apache.hadoop.io.Writable;
+31 import org.apache.hadoop.io.WritableComparable;
+32 import org.apache.hadoop.mapred.*;
+33 import org.apache.hadoop.mapred.lib.IdentityMapper;
+34 import org.apache.hadoop.mapred.lib.IdentityReducer;
+35 import org.apache.hadoop.mapred.lib.InputSampler;
+36 import org.apache.hadoop.mapred.lib.TotalOrderPartitioner;
+37 import org.apache.hadoop.util.Tool;
+38 import org.apache.hadoop.util.ToolRunner;
+
+This is the trivial map/reduce program that does absolutely nothing other than use the framework to fragment and sort the input values. To run: bin/hadoop jar build/hadoop-examples.jar sort [-m maps] [-r reduces] [-inFormat input format class] [-outFormat output format class] [-outKey output key class] [-outValue output value class] [-totalOrder pcnt num samples max splits] in-dir out-dir
+52 
+53 public class More ...Sort<K,V> extends Configured implements Tool {
+54   private RunningJob jobResult = null;
+55 
+56   static int More ...printUsage() {
+57     System.out.println("sort [-m <maps>] [-r <reduces>] " +
+58                        "[-inFormat <input format class>] " +
+59                        "[-outFormat <output format class>] " + 
+60                        "[-outKey <output key class>] " +
+61                        "[-outValue <output value class>] " +
+62                        "[-totalOrder <pcnt> <num samples> <max splits>] " +
+63                        "<input> <output>");
+64     ToolRunner.printGenericCommandUsage(System.out);
+65     return -1;
+66   }
+
+  
+The main driver for sort program. Invoke this method to submit the map/reduce job.
+Throws:
+java.io.IOException When there is communication problems with the job tracker.
+73 
+74   public int More ...run(String[] args) throws Exception {
+75 
+76     JobConf jobConf = new JobConf(getConf(), Sort.class);
+77     jobConf.setJobName("sorter");
+78 
+79     jobConf.setMapperClass(IdentityMapper.class);        
+80     jobConf.setReducerClass(IdentityReducer.class);
+81 
+82     JobClient client = new JobClient(jobConf);
+83     ClusterStatus cluster = client.getClusterStatus();
+84     int num_reduces = (int) (cluster.getMaxReduceTasks() * 0.9);
+85     String sort_reduces = jobConf.get("test.sort.reduces_per_host");
+86     if (sort_reduces != null) {
+87        num_reduces = cluster.getTaskTrackers() * 
+88                        Integer.parseInt(sort_reduces);
+89     }
+90     Class<? extends InputFormat> inputFormatClass = 
+91       SequenceFileInputFormat.class;
+92     Class<? extends OutputFormat> outputFormatClass = 
+93       SequenceFileOutputFormat.class;
+94     Class<? extends WritableComparable> outputKeyClass = BytesWritable.class;
+95     Class<? extends Writable> outputValueClass = BytesWritable.class;
+96     List<String> otherArgs = new ArrayList<String>();
+97     InputSampler.Sampler<K,V> sampler = null;
+98     for(int i=0; i < args.length; ++i) {
+99       try {
+100        if ("-m".equals(args[i])) {
+101          jobConf.setNumMapTasks(Integer.parseInt(args[++i]));
+102        } else if ("-r".equals(args[i])) {
+103          num_reduces = Integer.parseInt(args[++i]);
+104        } else if ("-inFormat".equals(args[i])) {
+105          inputFormatClass = 
+106            Class.forName(args[++i]).asSubclass(InputFormat.class);
+107        } else if ("-outFormat".equals(args[i])) {
+108          outputFormatClass = 
+109            Class.forName(args[++i]).asSubclass(OutputFormat.class);
+110        } else if ("-outKey".equals(args[i])) {
+111          outputKeyClass = 
+112            Class.forName(args[++i]).asSubclass(WritableComparable.class);
+113        } else if ("-outValue".equals(args[i])) {
+114          outputValueClass = 
+115            Class.forName(args[++i]).asSubclass(Writable.class);
+116        } else if ("-totalOrder".equals(args[i])) {
+117          double pcnt = Double.parseDouble(args[++i]);
+118          int numSamples = Integer.parseInt(args[++i]);
+119          int maxSplits = Integer.parseInt(args[++i]);
+120          if (0 >= maxSplits) maxSplits = Integer.MAX_VALUE;
+121          sampler =
+122            new InputSampler.RandomSampler<K,V>(pcnt, numSamples, maxSplits);
+123        } else {
+124          otherArgs.add(args[i]);
+125        }
+126      } catch (NumberFormatException except) {
+127        System.out.println("ERROR: Integer expected instead of " + args[i]);
+128        return printUsage();
+129      } catch (ArrayIndexOutOfBoundsException except) {
+130        System.out.println("ERROR: Required parameter missing from " +
+131            args[i-1]);
+132        return printUsage(); // exits
+133      }
+134    }
+135
+136    // Set user-supplied (possibly default) job configs
+137    jobConf.setNumReduceTasks(num_reduces);
+138
+139    jobConf.setInputFormat(inputFormatClass);
+140    jobConf.setOutputFormat(outputFormatClass);
+141
+142    jobConf.setOutputKeyClass(outputKeyClass);
+143    jobConf.setOutputValueClass(outputValueClass);
+144
+145    // Make sure there are exactly 2 parameters left.
+146    if (otherArgs.size() != 2) {
+147      System.out.println("ERROR: Wrong number of parameters: " +
+148          otherArgs.size() + " instead of 2.");
+149      return printUsage();
+150    }
+151    FileInputFormat.setInputPaths(jobConf, otherArgs.get(0));
+152    FileOutputFormat.setOutputPath(jobConf, new Path(otherArgs.get(1)));
+153
+154    if (sampler != null) {
+155      System.out.println("Sampling input to effect total-order sort...");
+156      jobConf.setPartitionerClass(TotalOrderPartitioner.class);
+157      Path inputDir = FileInputFormat.getInputPaths(jobConf)[0];
+158      inputDir = inputDir.makeQualified(inputDir.getFileSystem(jobConf));
+159      Path partitionFile = new Path(inputDir, "_sortPartitioning");
+160      TotalOrderPartitioner.setPartitionFile(jobConf, partitionFile);
+161      InputSampler.<K,V>writePartitionFile(jobConf, sampler);
+162      URI partitionUri = new URI(partitionFile.toString() +
+163                                 "#" + "_sortPartitioning");
+164      DistributedCache.addCacheFile(partitionUri, jobConf);
+165      DistributedCache.createSymlink(jobConf);
+166    }
+167
+168    System.out.println("Running on " +
+169        cluster.getTaskTrackers() +
+170        " nodes to sort from " + 
+171        FileInputFormat.getInputPaths(jobConf)[0] + " into " +
+172        FileOutputFormat.getOutputPath(jobConf) +
+173        " with " + num_reduces + " reduces.");
+174    Date startTime = new Date();
+175    System.out.println("Job started: " + startTime);
+176    jobResult = JobClient.runJob(jobConf);
+177    Date end_time = new Date();
+178    System.out.println("Job ended: " + end_time);
+179    System.out.println("The job took " + 
+180        (end_time.getTime() - startTime.getTime()) /1000 + " seconds.");
+181    return 0;
+182  }
+183
+184
+185
+186  public static void More ...main(String[] args) throws Exception {
+187    int res = ToolRunner.run(new Configuration(), new Sort(), args);
+188    System.exit(res);
+189  }
+
+  
+Get the last job that was run using this instance.
+Returns:
+the results of the last job that was run
+194
+195  public RunningJob More ...getResult() {
+196    return jobResult;
+197  }
+198}
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
+
+ 
